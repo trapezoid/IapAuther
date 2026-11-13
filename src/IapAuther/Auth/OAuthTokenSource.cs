@@ -15,7 +15,7 @@ internal sealed class OAuthTokenSource : ITokenSource, IDisposable
     private readonly string _clientId;
     private readonly bool _noBrowser;
     private readonly StderrLogger _logger;
-    private readonly RefreshTokenStore _store;
+    private readonly IRefreshTokenStore _store;
     private readonly Action<string>? _browserLauncher;
     private readonly PkceGoogleAuthorizationCodeFlow _flow;
 
@@ -24,7 +24,7 @@ internal sealed class OAuthTokenSource : ITokenSource, IDisposable
         string clientSecret,
         bool noBrowser = false,
         StderrLogger? logger = null,
-        RefreshTokenStore? store = null,
+        IRefreshTokenStore? store = null,
         HttpMessageHandler? httpMessageHandler = null,
         Action<string>? browserLauncher = null)
     {
@@ -39,7 +39,7 @@ internal sealed class OAuthTokenSource : ITokenSource, IDisposable
         _clientId = clientId;
         _noBrowser = noBrowser;
         _logger = logger ?? new StderrLogger(AppLogLevel.Warn);
-        _store = store ?? new RefreshTokenStore();
+        _store = store ?? new RefreshTokenStore(TokenStoreMode.Auto, logger: _logger);
         _browserLauncher = browserLauncher;
 
         var initializer = new GoogleAuthorizationCodeFlow.Initializer
@@ -68,7 +68,7 @@ internal sealed class OAuthTokenSource : ITokenSource, IDisposable
     {
         try
         {
-            var storedRefresh = _store.Load(_clientId);
+            var storedRefresh = await _store.LoadAsync(_clientId, cancellationToken).ConfigureAwait(false);
             if (!string.IsNullOrWhiteSpace(storedRefresh))
             {
                 try
@@ -81,13 +81,13 @@ internal sealed class OAuthTokenSource : ITokenSource, IDisposable
                 }
             }
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException && ex is not AuthException)
         {
             _logger.Debug("Could not read stored refresh token", ("error", ex.Message));
         }
 
         var (refreshToken, idToken) = await RunBrowserFlowAsync(cancellationToken).ConfigureAwait(false);
-        TrySaveRefreshToken(refreshToken);
+        await TrySaveRefreshTokenAsync(refreshToken, cancellationToken).ConfigureAwait(false);
         return idToken;
     }
 
@@ -111,7 +111,7 @@ internal sealed class OAuthTokenSource : ITokenSource, IDisposable
         if (!string.IsNullOrEmpty(response.RefreshToken) &&
             !string.Equals(response.RefreshToken, refreshToken, StringComparison.Ordinal))
         {
-            TrySaveRefreshToken(response.RefreshToken);
+            await TrySaveRefreshTokenAsync(response.RefreshToken, cancellationToken).ConfigureAwait(false);
         }
 
         return response.IdToken;
@@ -175,13 +175,13 @@ internal sealed class OAuthTokenSource : ITokenSource, IDisposable
         return (tokenResponse.RefreshToken, tokenResponse.IdToken);
     }
 
-    private void TrySaveRefreshToken(string refreshToken)
+    private async ValueTask TrySaveRefreshTokenAsync(string refreshToken, CancellationToken cancellationToken)
     {
         try
         {
-            _store.Save(_clientId, refreshToken);
+            await _store.SaveAsync(_clientId, refreshToken, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException && ex is not AuthException)
         {
             _logger.Warn("Could not persist refresh token; you will be asked to sign in again next run", ("error", ex.Message));
         }

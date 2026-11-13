@@ -1,0 +1,181 @@
+name: Cross-OS Test Matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: 'Build configuration (Release or Debug)'
+        required: false
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+
+permissions: {}
+
+concurrency:
+  group: test-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        shell: bash
+        env:
+          BUILD_CONFIG: ${{ inputs.configuration || 'Release' }}
+        run: >
+          dotnet build --no-restore -c "$BUILD_CONFIG"
+          -p:ContinuousIntegrationBuild=true
+          -p:TreatWarningsAsErrors=true
+
+      - name: Install Secret Service test dependencies (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dbus gnome-keyring libsecret-tools
+
+      - name: Run tests (Linux with Secret Service)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          BUILD_CONFIG: ${{ inputs.configuration || 'Release' }}
+          IAP_AUTHER_REQUIRE_OS_STORE_TESTS: 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/xdg-data" "$RUNNER_TEMP/xdg-config" "$RUNNER_TEMP/test-results"
+          export XDG_DATA_HOME="$RUNNER_TEMP/xdg-data"
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/xdg-config"
+
+          dbus-run-session -- bash -euo pipefail -c '
+            eval "$(printf "ci-test-pass\n" | gnome-keyring-daemon --daemonize --login --components=secrets)"
+
+            printf "ci-canary-secret" | secret-tool store --label="CI Canary" application ci-canary account canary
+            test "$(secret-tool lookup application ci-canary account canary)" = "ci-canary-secret"
+            secret-tool clear application ci-canary account canary
+
+            dotnet test --no-build -c "${BUILD_CONFIG}" \
+              -p:ContinuousIntegrationBuild=true \
+              -p:TreatWarningsAsErrors=true \
+              --logger "trx;LogFileName=linux.trx" \
+              --results-directory "$RUNNER_TEMP/test-results"
+          '
+
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          BUILD_CONFIG: ${{ inputs.configuration || 'Release' }}
+          IAP_AUTHER_REQUIRE_OS_STORE_TESTS: 'true'
+        run: |
+          $resultsDir = Join-Path $env:RUNNER_TEMP 'test-results'
+          New-Item -ItemType Directory -Force -Path $resultsDir | Out-Null
+
+          dotnet test --no-build -c $env:BUILD_CONFIG `
+            -p:ContinuousIntegrationBuild=true `
+            -p:TreatWarningsAsErrors=true `
+            --logger "trx;LogFileName=windows.trx" `
+            --results-directory $resultsDir
+
+      - name: Run tests (macOS with Keychain)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          BUILD_CONFIG: ${{ inputs.configuration || 'Release' }}
+          IAP_AUTHER_REQUIRE_OS_STORE_TESTS: 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/test-results"
+
+          ORIG_DEFAULT_KC="$(security default-keychain -d user 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' || true)"
+          echo "ORIG_DEFAULT_KC=$ORIG_DEFAULT_KC" >> "$GITHUB_ENV"
+
+          DEFAULT_KC="$RUNNER_TEMP/iap-auther-ci-default.keychain-db"
+          EXPLICIT_KC="$RUNNER_TEMP/iap-auther-ci-explicit.keychain-db"
+          KC_PASS="iap-auther-ci-keychain-pass"
+
+          for kc in "$DEFAULT_KC" "$EXPLICIT_KC"; do
+            security create-keychain -p "$KC_PASS" "$kc"
+            security set-keychain-settings "$kc"
+            security unlock-keychain -p "$KC_PASS" "$kc"
+          done
+
+          existing_keychains=()
+          while IFS= read -r line; do
+            trimmed="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//')"
+            if [ -n "$trimmed" ]; then
+              existing_keychains+=("$trimmed")
+            fi
+          done < <(security list-keychains -d user)
+
+          if [ "${#existing_keychains[@]}" -gt 0 ]; then
+            security list-keychains -d user -s "$DEFAULT_KC" "${existing_keychains[@]}"
+          else
+            security list-keychains -d user -s "$DEFAULT_KC"
+          fi
+          security default-keychain -d user -s "$DEFAULT_KC"
+
+          echo "IAP_AUTHER_CI_DEFAULT_KEYCHAIN=$DEFAULT_KC" >> "$GITHUB_ENV"
+          echo "IAP_AUTHER_TEST_MACOS_KEYCHAIN=$EXPLICIT_KC" >> "$GITHUB_ENV"
+
+          security add-generic-password -s "iap-auther-ci-canary" -a "canary" -w "ok" -U
+          test "$(security find-generic-password -s "iap-auther-ci-canary" -a "canary" -w)" = "ok"
+          security delete-generic-password -s "iap-auther-ci-canary" -a "canary"
+
+          export IAP_AUTHER_TEST_MACOS_KEYCHAIN="$EXPLICIT_KC"
+          dotnet test --no-build -c "$BUILD_CONFIG" \
+            -p:ContinuousIntegrationBuild=true \
+            -p:TreatWarningsAsErrors=true \
+            --logger "trx;LogFileName=macos.trx" \
+            --results-directory "$RUNNER_TEMP/test-results"
+
+      - name: Cleanup temporary CI keychains (macOS)
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          set +e
+          if [ -n "${IAP_AUTHER_CI_DEFAULT_KEYCHAIN:-}" ]; then
+            security delete-keychain "$IAP_AUTHER_CI_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
+          fi
+          if [ -n "${IAP_AUTHER_TEST_MACOS_KEYCHAIN:-}" ]; then
+            security delete-keychain "$IAP_AUTHER_TEST_MACOS_KEYCHAIN" >/dev/null 2>&1 || true
+          fi
+          if [ -n "${ORIG_DEFAULT_KC:-}" ] && [ -f "$ORIG_DEFAULT_KC" ]; then
+            security default-keychain -d user -s "$ORIG_DEFAULT_KC" >/dev/null 2>&1 || true
+          fi
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-${{ matrix.os }}
+          path: ${{ runner.temp }}/test-results/*.trx
+          if-no-files-found: ignore
+          retention-days: 14

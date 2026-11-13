@@ -44,6 +44,12 @@ internal sealed class SharedAuthOptions
         DefaultValueFactory = _ => EnvOr("IAP_AUTHER_OAUTH_CLIENT_SECRET", "IAP_MCP_OAUTH_CLIENT_SECRET"),
     };
 
+    public Option<string> TokenStore { get; } = new("--token-store")
+    {
+        Description = "OAuth refresh token store: auto (OS credential store with file fallback), os (OS credential store only), or file.",
+        DefaultValueFactory = _ => EnvOr("IAP_AUTHER_TOKEN_STORE", "IAP_MCP_TOKEN_STORE") ?? "auto",
+    };
+
     public Option<bool> NoBrowser { get; } = new("--no-browser")
     {
         Description = "Do not automatically open a browser during OAuth login; print the URL to log output (stderr by default) instead.",
@@ -69,6 +75,7 @@ internal sealed class SharedAuthOptions
         command.Add(CredentialFile);
         command.Add(OAuthClientId);
         command.Add(OAuthClientSecret);
+        command.Add(TokenStore);
         command.Add(NoBrowser);
         command.Add(LogLevel);
         command.Add(LogOutput);
@@ -129,6 +136,13 @@ internal sealed class SharedAuthOptions
             return false;
         }
 
+        var tokenStoreRaw = parseResult.GetValue(TokenStore) ?? "auto";
+        if (!TokenStoreModeExtensions.TryParse(tokenStoreRaw, out var tokenStoreMode))
+        {
+            errorMessage = $"unknown --token-store '{tokenStoreRaw}' (want auto, os, or file)";
+            return false;
+        }
+
         var impersonateSa = parseResult.GetValue(ImpersonateServiceAccount);
         if (!string.IsNullOrWhiteSpace(impersonateSa) && mode == CredentialMode.Auto)
         {
@@ -155,6 +169,7 @@ internal sealed class SharedAuthOptions
             CredentialFile = parseResult.GetValue(CredentialFile),
             OAuthClientId = parseResult.GetValue(OAuthClientId),
             OAuthClientSecret = parseResult.GetValue(OAuthClientSecret),
+            TokenStore = tokenStoreMode,
             RefreshMargin = refreshMargin,
             NoBrowser = parseResult.GetValue(NoBrowser),
             Logger = logger,

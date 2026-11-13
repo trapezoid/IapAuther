@@ -164,7 +164,7 @@ Direct Cloud Run IAP (Google-managed OAuth クライアント) の場合:
 | `adc` | OIDC ID トークン | Application Default Credentials (SA キー、Workload Identity、GCE メタデータ等) または `--credential-file` から OIDC ID トークンを取得。 |
 | `impersonate` | OIDC ID トークン | IAM Credentials API (`generateIdToken`) を呼び出し、指定 SA として OIDC ID トークンを発行 (`roles/iam.serviceAccountTokenCreator` が必要)。 |
 | `signjwt` | 自己署名 SA JWT | Direct Cloud Run IAP (Google-managed OAuth クライアント) 向け。`--impersonate-service-account` 指定時は IAM `signJwt` API を使用し、未指定かつ ADC/`--credential-file` が SA キーの場合はローカルの秘密鍵で直接署名 (`RS256`)。 |
-| `oauth` | OIDC ID トークン | デスクトップ OAuth 2.0 (PKCE + ローカルループバック `/authorize/` + ブラウザ認証)。リフレッシュトークンは Windows では DPAPI 暗号化ファイル、Linux/macOS では `0600` ファイルに永続化。 |
+| `oauth` | OIDC ID トークン | デスクトップ OAuth 2.0 (PKCE + ローカルループバック `/authorize/` + ブラウザ認証)。リフレッシュトークンは各 OS のクレデンシャルストア（Windows Credential Manager / macOS Keychain / Linux Secret Service over D-Bus）に保存し、利用不可時は従来ファイル（Windows: DPAPI、Linux/macOS: `0600`）へフォールバック（`--token-store` で切替可）。 |
 
 ## オプション・環境変数一覧
 
@@ -176,6 +176,7 @@ Direct Cloud Run IAP (Google-managed OAuth クライアント) の場合:
 | `--credential-file` | `IAP_AUTHER_CREDENTIAL_FILE` | — | SA JSON キーまたは ADC ファイルのパス |
 | `--oauth-client-id` | `IAP_AUTHER_OAUTH_CLIENT_ID` / `IAP_MCP_OAUTH_CLIENT_ID` | — | デスクトップ OAuth クライアント ID |
 | `--oauth-client-secret` | `IAP_AUTHER_OAUTH_CLIENT_SECRET` / `IAP_MCP_OAUTH_CLIENT_SECRET` | — | デスクトップ OAuth クライアントシークレット |
+| `--token-store` | `IAP_AUTHER_TOKEN_STORE` / `IAP_MCP_TOKEN_STORE` | `auto` | OAuth リフレッシュトークンの保存先 (`auto` / `os` / `file`)。`auto` は OS ストア優先（既存のファイル保存分を自動移行し旧ファイルを削除、OS ストア利用不可時はファイル保存へフォールバック）、`os` は OS ストア必須、`file` は従来ファイル (DPAPI / `0600`) |
 | `--no-browser` | — | `false` | ブラウザを自動起動せず認証 URL をログ出力先 (デフォルト `stderr`) に表示 |
 | `-l, --log-level` | `IAP_AUTHER_LOG` / `IAP_MCP_LOG` | `warn` | `debug` / `info` / `warn` / `error` |
 | `--log-output` | `IAP_AUTHER_LOG_OUTPUT` / `IAP_MCP_LOG_OUTPUT` | `stderr` | ログ・エラー・認証案内の出力先 (`stderr` / `stdout` / `both`)。`stdout` / `both` はデバッグ用途向け (`token` / `headers` / `mcp-proxy` の機械処理用 `stdout` に混ざるため通常利用時は非推奨) |
@@ -201,6 +202,8 @@ Direct Cloud Run IAP (Google-managed OAuth クライアント) の場合:
 ```sh
 dotnet test
 ```
+
+各 OS（Linux `ubuntu-latest` + GNOME Keyring / Windows `windows-latest` + Credential Manager / macOS `macos-latest` + Keychain）での実ストア結合テストを含むマトリクステストは、[`test-matrix.yml`](.github/workflows/test-matrix.yml) の `workflow_dispatch` から手動実行できます（GitHub Actions 無料枠の節約のため push / PR では自動実行しません）。
 
 ## リリース (NuGet Trusted Publishing)
 

@@ -1,101 +1,246 @@
-using System.Runtime.Versioning;
-using System.Security.Cryptography;
-using System.Text;
+using IapAuther.Logging;
 
 namespace IapAuther.Auth;
 
-internal sealed class RefreshTokenStore
+internal sealed class RefreshTokenStore : IRefreshTokenStore
 {
-    private readonly string _directory;
+    private readonly TokenStoreMode _mode;
+    private readonly IRefreshTokenStore? _osStore;
+    private readonly FileRefreshTokenStore _fileStore;
+    private readonly StderrLogger _logger;
+    private int _fallbackLogged;
 
-    public RefreshTokenStore(string? baseDirectory = null)
+    public RefreshTokenStore(string baseDirectory)
+        : this(TokenStoreMode.File, osStore: null, new FileRefreshTokenStore(baseDirectory), logger: null)
     {
-        if (!string.IsNullOrWhiteSpace(baseDirectory))
+        ArgumentException.ThrowIfNullOrWhiteSpace(baseDirectory);
+    }
+
+    public RefreshTokenStore(
+        TokenStoreMode mode = TokenStoreMode.Auto,
+        string? baseDirectory = null,
+        StderrLogger? logger = null)
+        : this(
+            mode,
+            mode == TokenStoreMode.File ? null : CreatePlatformOsStore(),
+            new FileRefreshTokenStore(baseDirectory),
+            logger)
+    {
+    }
+
+    internal RefreshTokenStore(
+        TokenStoreMode mode,
+        IRefreshTokenStore? osStore,
+        FileRefreshTokenStore fileStore,
+        StderrLogger? logger = null)
+    {
+        _mode = mode;
+        _osStore = osStore;
+        _fileStore = fileStore ?? throw new ArgumentNullException(nameof(fileStore));
+        _logger = logger ?? new StderrLogger(AppLogLevel.Warn);
+    }
+
+    public string BackendName =>
+        _mode == TokenStoreMode.File || _osStore is null
+            ? _fileStore.BackendName
+            : _osStore.BackendName;
+
+    public string GetTokenPath(string clientId) => _fileStore.GetTokenPath(clientId);
+
+    public string? Load(string clientId) =>
+        LoadAsync(clientId).AsTask().GetAwaiter().GetResult();
+
+    public void Save(string clientId, string refreshToken) =>
+        SaveAsync(clientId, refreshToken).AsTask().GetAwaiter().GetResult();
+
+    public void Delete(string clientId) =>
+        DeleteAsync(clientId).AsTask().GetAwaiter().GetResult();
+
+    public async ValueTask<string?> LoadAsync(string clientId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(clientId);
+
+        if (_mode == TokenStoreMode.File)
         {
-            _directory = baseDirectory;
+            return await _fileStore.LoadAsync(clientId, cancellationToken).ConfigureAwait(false);
         }
-        else
+
+        if (_osStore is null)
         {
-            var configDir = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-            if (string.IsNullOrWhiteSpace(configDir))
+            if (_mode == TokenStoreMode.Os)
             {
-                configDir = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
-                            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".config");
+                throw new AuthException("No native OS credential store backend is available on this platform.");
             }
-            _directory = Path.Combine(configDir, "iap-auther");
+            LogFallbackOnce("none", "no native OS credential store backend is available on this platform");
+            return await _fileStore.LoadAsync(clientId, cancellationToken).ConfigureAwait(false);
         }
-    }
 
-    public string GetTokenPath(string clientId)
-    {
-        var safeId = SanitizeFileName(clientId);
-        var suffix = OperatingSystem.IsWindows() ? ".dpapi" : "";
-        return Path.Combine(_directory, $"refresh-token-{safeId}{suffix}");
-    }
+        try
+        {
+            var token = await _osStore.LoadAsync(clientId, cancellationToken).ConfigureAwait(false);
+            if (token is not null)
+            {
+                return token;
+            }
+        }
+        catch (CredentialStoreUnavailableException ex)
+        {
+            if (_mode == TokenStoreMode.Os)
+            {
+                throw new AuthException(
+                    $"OS credential store ({_osStore.BackendName}) is unavailable: {ex.Message}",
+                    ex);
+            }
 
-    public string? Load(string clientId)
-    {
-        var path = GetTokenPath(clientId);
-        if (!File.Exists(path))
+            LogFallbackOnce(_osStore.BackendName, ex.Message);
+            return await _fileStore.LoadAsync(clientId, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (_mode == TokenStoreMode.Os)
         {
             return null;
         }
 
-        if (OperatingSystem.IsWindows())
+        var legacyToken = await _fileStore.LoadAsync(clientId, cancellationToken).ConfigureAwait(false);
+        if (!string.IsNullOrWhiteSpace(legacyToken))
         {
-            var encrypted = File.ReadAllBytes(path);
-            var plaintext = UnprotectWindows(encrypted);
-            return Encoding.UTF8.GetString(plaintext);
+            try
+            {
+                await _osStore.SaveAsync(clientId, legacyToken, cancellationToken).ConfigureAwait(false);
+                _logger.Info(
+                    "Migrated OAuth refresh token from legacy file store to OS credential store",
+                    ("backend", _osStore.BackendName));
+                await TryDeleteLegacyFileAsync(clientId, cancellationToken).ConfigureAwait(false);
+            }
+            catch (CredentialStoreUnavailableException ex)
+            {
+                LogFallbackOnce(_osStore.BackendName, ex.Message);
+            }
         }
 
-        return File.ReadAllText(path, Encoding.UTF8);
+        return legacyToken;
     }
 
-    public void Save(string clientId, string refreshToken)
+    public async ValueTask SaveAsync(string clientId, string refreshToken, CancellationToken cancellationToken = default)
     {
-        if (OperatingSystem.IsWindows())
+        ArgumentException.ThrowIfNullOrWhiteSpace(clientId);
+        ArgumentNullException.ThrowIfNull(refreshToken);
+
+        if (_mode == TokenStoreMode.File)
         {
-            Directory.CreateDirectory(_directory);
-            var bytes = ProtectWindows(Encoding.UTF8.GetBytes(refreshToken));
-            File.WriteAllBytes(GetTokenPath(clientId), bytes);
+            await _fileStore.SaveAsync(clientId, refreshToken, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (!Directory.Exists(_directory))
+        if (_osStore is null)
         {
-            Directory.CreateDirectory(
-                _directory,
-                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            if (_mode == TokenStoreMode.Os)
+            {
+                throw new AuthException("No native OS credential store backend is available on this platform.");
+            }
+            LogFallbackOnce("none", "no native OS credential store backend is available on this platform");
+            await _fileStore.SaveAsync(clientId, refreshToken, cancellationToken).ConfigureAwait(false);
+            return;
         }
 
-        var path = GetTokenPath(clientId);
-        using var fs = new FileStream(path, new FileStreamOptions
+        try
         {
-            Mode = FileMode.Create,
-            Access = FileAccess.Write,
-            Share = FileShare.None,
-            UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite,
-        });
-        var payload = Encoding.UTF8.GetBytes(refreshToken);
-        fs.Write(payload);
+            await _osStore.SaveAsync(clientId, refreshToken, cancellationToken).ConfigureAwait(false);
+            if (_mode == TokenStoreMode.Auto)
+            {
+                await TryDeleteLegacyFileAsync(clientId, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (CredentialStoreUnavailableException ex)
+        {
+            if (_mode == TokenStoreMode.Os)
+            {
+                throw new AuthException(
+                    $"OS credential store ({_osStore.BackendName}) is unavailable: {ex.Message}",
+                    ex);
+            }
+
+            LogFallbackOnce(_osStore.BackendName, ex.Message);
+            await _fileStore.SaveAsync(clientId, refreshToken, cancellationToken).ConfigureAwait(false);
+        }
     }
 
-    [SupportedOSPlatform("windows")]
-    private static byte[] ProtectWindows(byte[] data) =>
-        ProtectedData.Protect(data, optionalEntropy: null, DataProtectionScope.CurrentUser);
-
-    [SupportedOSPlatform("windows")]
-    private static byte[] UnprotectWindows(byte[] data) =>
-        ProtectedData.Unprotect(data, optionalEntropy: null, DataProtectionScope.CurrentUser);
-
-    private static string SanitizeFileName(string value)
+    public async ValueTask DeleteAsync(string clientId, CancellationToken cancellationToken = default)
     {
-        var invalid = Path.GetInvalidFileNameChars();
-        var sb = new StringBuilder(value.Length);
-        foreach (var ch in value)
+        ArgumentException.ThrowIfNullOrWhiteSpace(clientId);
+
+        if (_mode != TokenStoreMode.File)
         {
-            sb.Append(Array.IndexOf(invalid, ch) >= 0 ? '_' : ch);
+            if (_osStore is null)
+            {
+                if (_mode == TokenStoreMode.Os)
+                {
+                    throw new AuthException("No native OS credential store backend is available on this platform.");
+                }
+            }
+            else
+            {
+                try
+                {
+                    await _osStore.DeleteAsync(clientId, cancellationToken).ConfigureAwait(false);
+                }
+                catch (CredentialStoreUnavailableException ex)
+                {
+                    if (_mode == TokenStoreMode.Os)
+                    {
+                        throw new AuthException(
+                            $"OS credential store ({_osStore.BackendName}) is unavailable: {ex.Message}",
+                            ex);
+                    }
+                    LogFallbackOnce(_osStore.BackendName, ex.Message);
+                }
+            }
         }
-        return sb.ToString();
+
+        if (_mode != TokenStoreMode.Os)
+        {
+            await _fileStore.DeleteAsync(clientId, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    internal static IRefreshTokenStore? CreatePlatformOsStore()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return new WindowsCredentialStore();
+        }
+        if (OperatingSystem.IsMacOS())
+        {
+            return new MacOSKeychainStore();
+        }
+        if (OperatingSystem.IsLinux())
+        {
+            return new LinuxSecretServiceStore();
+        }
+        return null;
+    }
+
+    private async Task TryDeleteLegacyFileAsync(string clientId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _fileStore.DeleteAsync(clientId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.Debug("Could not remove legacy refresh token file after migration", ("error", ex.Message));
+        }
+    }
+
+    private void LogFallbackOnce(string backend, string reason)
+    {
+        if (Interlocked.Exchange(ref _fallbackLogged, 1) == 0)
+        {
+            _logger.Warn(
+                "OS credential store unavailable; falling back to file token store",
+                ("backend", backend),
+                ("fallback", _fileStore.BackendName),
+                ("error", reason));
+        }
     }
 }

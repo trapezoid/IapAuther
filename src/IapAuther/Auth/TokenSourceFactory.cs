@@ -46,7 +46,8 @@ internal static class TokenSourceFactory
                     config.OAuthClientId ?? "",
                     config.OAuthClientSecret ?? "",
                     config.NoBrowser,
-                    log);
+                    log,
+                    new RefreshTokenStore(config.TokenStore, logger: log));
                 break;
 
             case CredentialMode.Auto:
@@ -78,7 +79,8 @@ internal static class TokenSourceFactory
                             config.OAuthClientId ?? "",
                             config.OAuthClientSecret ?? "",
                             config.NoBrowser,
-                            log);
+                            log,
+                            new RefreshTokenStore(config.TokenStore, logger: log));
                     }
                     catch (AuthException oauthEx)
                     {
