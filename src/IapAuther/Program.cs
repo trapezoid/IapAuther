@@ -37,8 +37,9 @@ internal static class Program
         TextWriter? error = null,
         CancellationToken cancellationToken = default)
     {
-        var root = new RootCommand("Authenticate with Google Cloud Identity-Aware Proxy (IAP) — issue tokens or run as a stdio-to-HTTP MCP proxy.");
+        var root = new RootCommand("Authenticate with Google Cloud Identity-Aware Proxy (IAP) — issue tokens, emit headersHelper JSON, or run as a stdio-to-HTTP MCP proxy.");
         root.Add(TokenCommand.Create(output, error));
+        root.Add(HeadersCommand.Create(output, error));
         root.Add(McpProxyCommand.Create(output, error));
 
         var parseResult = root.Parse(args);

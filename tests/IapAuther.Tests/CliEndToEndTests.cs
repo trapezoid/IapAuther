@@ -254,6 +254,127 @@ public sealed class CliEndToEndTests : IDisposable
         Assert.Contains("unknown --log-output 'invalid'", errWriter.ToString());
     }
 
+    [Fact]
+    public async Task HeadersCommand_SignJwtWithExtraHeaders_OutputsSingleLineJsonAndRoutesLogsToStderr()
+    {
+        using var outWriter = new StringWriter();
+        using var errWriter = new StringWriter();
+
+        var exitCode = await Program.RunAsync(
+            [
+                "headers",
+                "--credentials", "signjwt",
+                "--credential-file", _tempKeyPath,
+                "--log-level", "info",
+                "-H", "X-Tenant-Id: team-a",
+                "--header", "Authorization: Bearer app+key=123",
+                "-H", "x-tenant-id: team-b",
+                "https://my-mcp-xxxx.a.run.app/mcp",
+            ],
+            outWriter,
+            errWriter);
+
+        Assert.True(exitCode == ExitCodes.Ok, $"Expected exit 0, got {exitCode}. Stderr: {errWriter}");
+        var stdoutText = outWriter.ToString();
+        var stdoutLines = stdoutText.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var jsonLine = Assert.Single(stdoutLines);
+        Assert.Contains("Bearer app+key=123", jsonLine);
+
+        using var doc = JsonDocument.Parse(jsonLine);
+        var root = doc.RootElement;
+        var proxyAuth = root.GetProperty("Proxy-Authorization").GetString()!;
+        Assert.StartsWith("Bearer ", proxyAuth);
+        var claims = JwtUtils.ExtractClaims(proxyAuth["Bearer ".Length..]);
+        Assert.Equal("test-sa@test-project.iam.gserviceaccount.com", claims.Issuer);
+        Assert.Equal("https://my-mcp-xxxx.a.run.app/mcp", claims.Audience);
+
+        Assert.Equal("Bearer app+key=123", root.GetProperty("Authorization").GetString());
+        Assert.Equal("team-b", root.GetProperty("x-tenant-id").GetString());
+        Assert.False(root.TryGetProperty("X-Tenant-Id", out _));
+
+        var stderr = errWriter.ToString();
+        Assert.Contains("level=INFO", stderr);
+        Assert.Contains("No --audience given; derived from upstream URL", stderr);
+    }
+
+    [Fact]
+    public async Task HeadersCommand_EnvIndirection_ResolvesValueAndRejectsMissingVar()
+    {
+        const string envName = "IAP_AUTHER_TEST_HEADER_VALUE";
+        var original = Environment.GetEnvironmentVariable(envName);
+        try
+        {
+            Environment.SetEnvironmentVariable(envName, "Bearer secret-from-env");
+            using var outWriter = new StringWriter();
+            using var errWriter = new StringWriter();
+
+            var okCode = await Program.RunAsync(
+                [
+                    "headers",
+                    "--credentials", "signjwt",
+                    "--credential-file", _tempKeyPath,
+                    "-H", $"Authorization: env:{envName}",
+                    "https://my-mcp-xxxx.a.run.app/mcp",
+                ],
+                outWriter,
+                errWriter);
+
+            Assert.Equal(ExitCodes.Ok, okCode);
+            using var doc = JsonDocument.Parse(outWriter.ToString());
+            Assert.Equal("Bearer secret-from-env", doc.RootElement.GetProperty("Authorization").GetString());
+
+            Environment.SetEnvironmentVariable(envName, null);
+            using var failOut = new StringWriter();
+            using var failErr = new StringWriter();
+            var failCode = await Program.RunAsync(
+                [
+                    "headers",
+                    "--credentials", "signjwt",
+                    "--credential-file", _tempKeyPath,
+                    "-H", $"Authorization: env:{envName}",
+                    "https://my-mcp-xxxx.a.run.app/mcp",
+                ],
+                failOut,
+                failErr);
+
+            Assert.Equal(ExitCodes.ConfigOrFatalError, failCode);
+            Assert.Equal(string.Empty, failOut.ToString());
+            Assert.Contains($"env:{envName}", failErr.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(envName, original);
+        }
+    }
+
+    [Theory]
+    [InlineData("MissingColon", "expected 'Name: Value'")]
+    [InlineData(": no-name", "expected 'Name: Value'")]
+    [InlineData("Bad Name: value", "invalid header name")]
+    [InlineData("proxy-authorization: Bearer override", "cannot override 'Proxy-Authorization'")]
+    [InlineData("X-Inject: line1\nline2", "invalid control characters")]
+    [InlineData("X-EmptyEnv: env:", "empty 'env:' reference")]
+    public async Task HeadersCommand_RejectsInvalidHeaders(string headerArg, string expectedError)
+    {
+        using var outWriter = new StringWriter();
+        using var errWriter = new StringWriter();
+
+        var exitCode = await Program.RunAsync(
+            [
+                "headers",
+                "--credentials", "signjwt",
+                "--credential-file", _tempKeyPath,
+                "-H", headerArg,
+                "https://my-mcp-xxxx.a.run.app/mcp",
+            ],
+            outWriter,
+            errWriter);
+
+        Assert.Equal(ExitCodes.ConfigOrFatalError, exitCode);
+        Assert.Equal(string.Empty, outWriter.ToString());
+        Assert.Contains(expectedError, errWriter.ToString());
+    }
+
     public void Dispose()
     {
         if (File.Exists(_tempKeyPath))

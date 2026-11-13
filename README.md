@@ -3,6 +3,7 @@
 Google Cloud Identity-Aware Proxy (Cloud IAP) でのさまざまな認証に対応する **.NET 10** 製 CLI ツールです。
 
 - **トークン発行 (`token`)**: OIDC ID トークンや自己署名サービスアカウント JWT を発行して標準出力へ出力 (`curl` 等との連携に最適)
+- **headersHelper 用 JSON 出力 (`headers`)**: `Proxy-Authorization` と任意の追加ヘッダ (`-H` / `--header`) を含む JSON オブジェクトを標準出力へ出力 (Claude Code 等の `headersHelper` 向け)
 - **MCP Proxy (`mcp-proxy`)**: stdio クライアント (Claude Desktop / Claude Code / Cursor 等) と IAP 保護された HTTP MCP サーバー (Streamable HTTP / Legacy HTTP+SSE) を公式 [MCP C# SDK](https://github.com/modelcontextprotocol/csharp-sdk) (`ModelContextProtocol.Core`) 経由でつなぐブリッジ
 
 ## 必要環境
@@ -66,19 +67,53 @@ iap-auther token \
 - `header`: `Proxy-Authorization: Bearer <token>` 形式で出力
 - `json`: トークン・audience・有効期限 (`expires_at`)・claims (`subject`, `issuer`, `email`) 等を JSON で出力
 
+---
+
+### 2. `headersHelper` 用 JSON 出力モード (`headers`)
+
+```sh
+iap-auther headers [options] [UPSTREAM_URL]
+```
+
+`Proxy-Authorization: Bearer <token>` と、`-H` / `--header` で指定した任意の追加ヘッダをまとめた JSON オブジェクトを 1 行で標準出力へ出力します（Claude Code 等の HTTP/WebSocket MCP `headersHelper` からそのまま呼び出せます）。
+
+```sh
+# 基本形 ({"Proxy-Authorization":"Bearer ..."} を出力)
+iap-auther headers --audience 1234567890-abc.apps.googleusercontent.com
+
+# 追加ヘッダ付き (下流の Authorization を環境変数から渡す例)
+iap-auther headers \
+  --credentials signjwt \
+  --impersonate-service-account mcp-caller@my-project.iam.gserviceaccount.com \
+  -H "Authorization: env:DOWNSTREAM_TOKEN" \
+  -H "X-Tenant-Id: team-a" \
+  https://my-svc-xxxx.a.run.app/mcp
+```
+
+Claude Code (`~/.claude.json` 等) の設定例:
+
+```json
+{
+  "mcpServers": {
+    "my-iap-mcp": {
+      "type": "http",
+      "url": "https://my-svc-xxxx.a.run.app/mcp",
+      "headersHelper": "iap-auther headers --credentials signjwt --impersonate-service-account mcp-caller@my-project.iam.gserviceaccount.com -H \"Authorization: env:DOWNSTREAM_TOKEN\" https://my-svc-xxxx.a.run.app/mcp"
+    }
+  }
+}
+```
+
 #### Claude Code 等の `headersHelper` で使う場合の注意点
 
-- **出力形式のラップ**: Claude Code の HTTP/WebSocket MCP 設定にある `headersHelper` は標準出力に `{"Header-Name": "value"}` 形式の JSON（例: `{"Proxy-Authorization": "Bearer <token>"}`）を期待するため、`token` の出力を次のようにラップします。
-  ```sh
-  printf '{"Proxy-Authorization":"Bearer %s"}\n' "$(iap-auther token --audience 1234567890-abc.apps.googleusercontent.com)"
-  ```
-- **`stdout` 汚染の防止と `--log-output`**: デフォルト（`--log-output stderr`）ではログ・エラー・OAuth 認証案内はすべて `stderr` に出力され、ブラウザ起動プロセス（`open` / `xdg-open`）の出力も `/dev/null` へ破棄されるため、`stdout` にはトークン／JSON のみが出力されます。切り分け・デバッグ等で `stdout` にもログを出したい場合は `--log-output both`（または `stdout`）を指定してください。
-- **タイムアウト対策（OAuth の事前サインイン）**: `headersHelper` には短い実行タイムアウト（Claude Code では約 10 秒）があります。`--credentials oauth`（または `auto` からのフォールバック）を使う場合は、事前にターミナルから一度 `iap-auther token ...` を手動実行してブラウザ認証を完了し、リフレッシュトークンをキャッシュさせてから `headersHelper` を動かしてください（2 回目以降はキャッシュ済みリフレッシュトークンで高速に更新されます）。
-- **プロジェクトスコープの環境変数制限**: プロジェクトスコープの `.mcp.json` では、クライアント側のセキュリティ制限により `TOKEN` / `SECRET` / `KEY` / `AUTH` 等を含む環境変数（`IAP_AUTHER_OAUTH_CLIENT_SECRET` 等）が `headersHelper` に渡らない場合があります。ラッパースクリプトで引数を渡すかユーザースコープで設定する、あるいはトークン更新と 401/302 リトライを内蔵した [`mcp-proxy` モード](#2-mcp-proxy-モード-mcp-proxy) の利用を検討してください。
+- **`-H` / `--header` による追加ヘッダ指定**: `-H "Name: Value"` を複数回指定でき、値に `env:VAR_NAME` を書くと環境変数から展開します（`Proxy-Authorization` は IAP トークンで自動設定されるため `-H` での上書きはできません）。
+- **`stdout` 汚染の防止と `--log-output`**: デフォルト（`--log-output stderr`）ではログ・エラー・OAuth 認証案内はすべて `stderr` に出力され、ブラウザ起動プロセス（`open` / `xdg-open`）の出力も `/dev/null` へ破棄されるため、`stdout` には JSON（`token` ではトークン／JSON）のみが出力されます。切り分け・デバッグ等で `stdout` にもログを出したい場合は `--log-output both`（または `stdout`）を指定してください。
+- **タイムアウト対策（OAuth の事前サインイン）**: `headersHelper` には短い実行タイムアウト（Claude Code では約 10 秒）があります。`--credentials oauth`（または `auto` からのフォールバック）を使う場合は、事前にターミナルから一度 `iap-auther headers ...` または `iap-auther token ...` を手動実行してブラウザ認証を完了し、リフレッシュトークンをキャッシュさせてから `headersHelper` を動かしてください（2 回目以降はキャッシュ済みリフレッシュトークンで高速に更新されます）。
+- **プロジェクトスコープの環境変数制限**: プロジェクトスコープの `.mcp.json` では、クライアント側のセキュリティ制限により `TOKEN` / `SECRET` / `KEY` / `AUTH` 等を含む環境変数（`IAP_AUTHER_OAUTH_CLIENT_SECRET` や `env:DOWNSTREAM_TOKEN` 等）が `headersHelper` に渡らない場合があります。ラッパースクリプトやユーザースコープ設定を利用するか、トークン更新と 401/302 リトライを内蔵した [`mcp-proxy` モード](#3-mcp-proxy-モード-mcp-proxy) の利用を検討してください。
 
 ---
 
-### 2. MCP Proxy モード (`mcp-proxy`)
+### 3. MCP Proxy モード (`mcp-proxy`)
 
 ```sh
 iap-auther mcp-proxy [options] <UPSTREAM_URL>
@@ -143,7 +178,9 @@ Direct Cloud Run IAP (Google-managed OAuth クライアント) の場合:
 | `--oauth-client-secret` | `IAP_AUTHER_OAUTH_CLIENT_SECRET` / `IAP_MCP_OAUTH_CLIENT_SECRET` | — | デスクトップ OAuth クライアントシークレット |
 | `--no-browser` | — | `false` | ブラウザを自動起動せず認証 URL をログ出力先 (デフォルト `stderr`) に表示 |
 | `-l, --log-level` | `IAP_AUTHER_LOG` / `IAP_MCP_LOG` | `warn` | `debug` / `info` / `warn` / `error` |
-| `--log-output` | `IAP_AUTHER_LOG_OUTPUT` / `IAP_MCP_LOG_OUTPUT` | `stderr` | ログ・エラー・認証案内の出力先 (`stderr` / `stdout` / `both`)。`stdout` / `both` はデバッグ用途向け (`token` や `mcp-proxy` の機械処理用 `stdout` に混ざるため通常利用時は非推奨) |
+| `--log-output` | `IAP_AUTHER_LOG_OUTPUT` / `IAP_MCP_LOG_OUTPUT` | `stderr` | ログ・エラー・認証案内の出力先 (`stderr` / `stdout` / `both`)。`stdout` / `both` はデバッグ用途向け (`token` / `headers` / `mcp-proxy` の機械処理用 `stdout` に混ざるため通常利用時は非推奨) |
+| `-f, --format` *(token)* | — | `raw` | 出力形式 (`raw` / `header` / `json`) |
+| `-H, --header` *(headers)* | — | — | 追加 HTTP ヘッダ (`Name: Value` 形式、複数指定可、`env:VAR_NAME` 参照対応) |
 | `--downstream-auth` *(mcp-proxy)* | `IAP_AUTHER_DOWNSTREAM_AUTH` / `IAP_MCP_DOWNSTREAM_AUTH` | — | 上流 `Authorization` ヘッダーに転送する値 (`env:VAR_NAME` 参照対応) |
 | `--refresh-margin` *(mcp-proxy)* | `IAP_AUTHER_REFRESH_MARGIN` / `IAP_MCP_REFRESH_MARGIN` | `5m` | 有効期限の指定時間前にトークンを更新 |
 | `--timeout` *(mcp-proxy)* | `IAP_AUTHER_TIMEOUT` / `IAP_MCP_TIMEOUT` | `120s` | JSON レスポンスの全体タイムアウト / SSE ストリームのアイドルタイムアウト |
