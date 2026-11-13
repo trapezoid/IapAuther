@@ -129,7 +129,7 @@ Direct Cloud Run IAP (Google-managed OAuth クライアント) の場合:
 | `adc` | OIDC ID トークン | Application Default Credentials (SA キー、Workload Identity、GCE メタデータ等) または `--credential-file` から OIDC ID トークンを取得。 |
 | `impersonate` | OIDC ID トークン | IAM Credentials API (`generateIdToken`) を呼び出し、指定 SA として OIDC ID トークンを発行 (`roles/iam.serviceAccountTokenCreator` が必要)。 |
 | `signjwt` | 自己署名 SA JWT | Direct Cloud Run IAP (Google-managed OAuth クライアント) 向け。`--impersonate-service-account` 指定時は IAM `signJwt` API を使用し、未指定かつ ADC/`--credential-file` が SA キーの場合はローカルの秘密鍵で直接署名 (`RS256`)。 |
-| `oauth` | OIDC ID トークン | デスクトップ OAuth 2.0 (PKCE + ローカルループバック `/callback` + ブラウザ認証)。リフレッシュトークンは Windows では DPAPI 暗号化ファイル、Linux/macOS では `0600` ファイルに永続化。 |
+| `oauth` | OIDC ID トークン | デスクトップ OAuth 2.0 (PKCE + ローカルループバック `/authorize/` + ブラウザ認証)。リフレッシュトークンは Windows では DPAPI 暗号化ファイル、Linux/macOS では `0600` ファイルに永続化。 |
 
 ## オプション・環境変数一覧
 
