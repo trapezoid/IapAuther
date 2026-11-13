@@ -1,0 +1,13 @@
+bin/
+obj/
+out/
+publish/
+.vs/
+.vscode/
+*.user
+*.suo
+*.nupkg
+*.snupkg
+TestResults/
+coverage/
+.DS_Store

@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>iap-auther</ToolCommandName>
+    <PackageId>IapAuther</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>trapezoid</Authors>
+    <Description>CLI tool for authenticating with Google Cloud Identity-Aware Proxy (IAP), supporting both token issuance and MCP C# SDK stdio-to-HTTP proxy modes.</Description>
+    <PackageProjectUrl>https://github.com/trapezoid/IapAuther</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/trapezoid/IapAuther</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <PackageTags>google-cloud;iap;cloud-iap;mcp;modelcontextprotocol;oidc;jwt;cli;dotnet-tool</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="IapAuther.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Google.Apis.Auth" Version="1.78.0" />
+    <PackageReference Include="Google.Apis.IAMCredentials.v1" Version="1.78.0.4198" />
+    <PackageReference Include="ModelContextProtocol.Core" Version="2.4.0" />
+    <PackageReference Include="System.CommandLine" Version="2.0.15" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.0" />
+  </ItemGroup>
+
+</Project>

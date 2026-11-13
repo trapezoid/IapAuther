@@ -1,0 +1,196 @@
+name: Publish NuGet Package
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version override (without leading v; defaults to <Version> in IapAuther.csproj)'
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build, Test & Pack
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.resolve_version.outputs.version }}
+      is_prerelease: ${{ steps.resolve_version.outputs.is_prerelease }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Resolve package version
+        id: resolve_version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            RAW_VERSION="${GITHUB_REF_NAME#v}"
+          elif [[ -n "$INPUT_VERSION" ]]; then
+            RAW_VERSION="${INPUT_VERSION#v}"
+          else
+            RAW_VERSION="$(dotnet msbuild src/IapAuther/IapAuther.csproj -getProperty:Version)"
+          fi
+
+          if [[ ! "$RAW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid SemVer version '$RAW_VERSION' (expected e.g. 0.1.0 or 0.1.0-preview.1)."
+            exit 1
+          fi
+
+          IS_PRERELEASE="false"
+          if [[ "$RAW_VERSION" == *-* ]]; then
+            IS_PRERELEASE="true"
+          fi
+
+          echo "Resolved package version: $RAW_VERSION (prerelease=$IS_PRERELEASE)"
+          echo "version=$RAW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build (Release)
+        env:
+          PKG_VERSION: ${{ steps.resolve_version.outputs.version }}
+        run: >
+          dotnet build --no-restore -c Release
+          -p:Version="$PKG_VERSION"
+          -p:ContinuousIntegrationBuild=true
+          -p:TreatWarningsAsErrors=true
+
+      - name: Run tests
+        env:
+          PKG_VERSION: ${{ steps.resolve_version.outputs.version }}
+        run: >
+          dotnet test --no-build -c Release
+          -p:Version="$PKG_VERSION"
+          -p:ContinuousIntegrationBuild=true
+          -p:TreatWarningsAsErrors=true
+
+      - name: Pack NuGet package
+        env:
+          PKG_VERSION: ${{ steps.resolve_version.outputs.version }}
+        run: >
+          dotnet pack src/IapAuther/IapAuther.csproj --no-build -c Release -o ./nupkg
+          -p:Version="$PKG_VERSION"
+          -p:ContinuousIntegrationBuild=true
+          -p:TreatWarningsAsErrors=true
+
+      - name: Smoke test packed dotnet tool
+        env:
+          PKG_VERSION: ${{ steps.resolve_version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet tool install IapAuther \
+            --tool-path ./tool-smoke \
+            --add-source ./nupkg \
+            --version "$PKG_VERSION"
+          ./tool-smoke/iap-auther --version
+          ./tool-smoke/iap-auther --help
+          ./tool-smoke/iap-auther mcp-proxy --help
+
+      - name: Upload NuGet package artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: nupkg
+          path: ./nupkg/*.nupkg
+          if-no-files-found: error
+          retention-days: 14
+
+  publish_nuget:
+    name: Publish to NuGet.org
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download NuGet package artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: nupkg
+          path: ./nupkg
+
+      - name: NuGet Login (OIDC Trusted Publishing)
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: trapezoid
+
+      - name: Push package to NuGet.org
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(./nupkg/*.nupkg)
+          if [ ${#packages[@]} -eq 0 ]; then
+            echo "::error::No .nupkg files found to publish."
+            exit 1
+          fi
+          dotnet nuget push "${packages[@]}" \
+            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
+
+  github_release:
+    name: Create GitHub Release
+    needs:
+      - build
+      - publish_nuget
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download NuGet package artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: nupkg
+          path: ./nupkg
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          IS_PRERELEASE: ${{ needs.build.outputs.is_prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(./nupkg/*.nupkg)
+          if gh release view "$GITHUB_REF_NAME" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --repo "$GH_REPO" --clobber
+          else
+            flags=(--repo "$GH_REPO" --verify-tag --generate-notes --title "$GITHUB_REF_NAME")
+            if [ "$IS_PRERELEASE" = "true" ]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" "${flags[@]}"
+          fi
