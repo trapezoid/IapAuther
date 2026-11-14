@@ -24,10 +24,12 @@ public sealed class RefreshTokenStoreTests : IDisposable
         public Func<string, Exception?>? OnLoad { get; set; }
         public Func<string, string, Exception?>? OnSave { get; set; }
         public Func<string, Exception?>? OnDelete { get; set; }
+        public Func<Exception?>? OnClear { get; set; }
 
         public int LoadCalls { get; private set; }
         public int SaveCalls { get; private set; }
         public int DeleteCalls { get; private set; }
+        public int ClearCalls { get; private set; }
 
         public ValueTask<string?> LoadAsync(string clientId, CancellationToken cancellationToken = default)
         {
@@ -52,7 +54,7 @@ public sealed class RefreshTokenStoreTests : IDisposable
             return ValueTask.CompletedTask;
         }
 
-        public ValueTask DeleteAsync(string clientId, CancellationToken cancellationToken = default)
+        public ValueTask<bool> DeleteAsync(string clientId, CancellationToken cancellationToken = default)
         {
             DeleteCalls++;
             var err = OnDelete?.Invoke(clientId);
@@ -60,8 +62,20 @@ public sealed class RefreshTokenStoreTests : IDisposable
             {
                 throw err;
             }
-            _items.Remove(clientId);
-            return ValueTask.CompletedTask;
+            return new ValueTask<bool>(_items.Remove(clientId));
+        }
+
+        public ValueTask<int> ClearAsync(CancellationToken cancellationToken = default)
+        {
+            ClearCalls++;
+            var err = OnClear?.Invoke();
+            if (err is not null)
+            {
+                throw err;
+            }
+            var count = _items.Count;
+            _items.Clear();
+            return new ValueTask<int>(count);
         }
     }
 
@@ -81,11 +95,71 @@ public sealed class RefreshTokenStoreTests : IDisposable
         Assert.False(File.Exists(fileStore.GetTokenPath("client-1")));
         Assert.Equal("fresh-os-token", await store.LoadAsync("client-1"));
 
-        await store.DeleteAsync("client-1");
+        Assert.True(await store.DeleteAsync("client-1"));
+        Assert.False(await store.DeleteAsync("client-1"));
         Assert.Null(await store.LoadAsync("client-1"));
         Assert.Equal(2, osStore.LoadCalls);
         Assert.Equal(1, osStore.SaveCalls);
-        Assert.Equal(1, osStore.DeleteCalls);
+        Assert.Equal(2, osStore.DeleteCalls);
+    }
+
+    [Fact]
+    public async Task AutoMode_ClearAsync_ClearsBothOsStoreAndLegacyFiles()
+    {
+        var osStore = new FakeOsStore();
+        await osStore.SaveAsync("client-os-1", "rt-1");
+        await osStore.SaveAsync("client-os-2", "rt-2");
+
+        var fileStore = new FileRefreshTokenStore(_tempDir);
+        await fileStore.SaveAsync("client-os-2", "legacy-dup");
+        await fileStore.SaveAsync("client-file-only", "legacy-3");
+        var unrelatedPath = Path.Combine(_tempDir, "unrelated.json");
+        await File.WriteAllTextAsync(unrelatedPath, "keep-me", Encoding.UTF8);
+
+        var store = new RefreshTokenStore(TokenStoreMode.Auto, osStore, fileStore);
+        var result = await store.ClearDetailedAsync();
+
+        Assert.Equal(4, result.DeletedCount);
+        Assert.Equal(2, result.OsDeletedCount);
+        Assert.Equal(2, result.FileDeletedCount);
+        Assert.Equal("fake-os-store", result.OsBackend);
+        Assert.Equal(fileStore.BackendName, result.FileBackend);
+        Assert.False(result.OsUnavailableFallback);
+
+        Assert.Null(await osStore.LoadAsync("client-os-1"));
+        Assert.Null(await osStore.LoadAsync("client-os-2"));
+        Assert.Null(await fileStore.LoadAsync("client-os-2"));
+        Assert.Null(await fileStore.LoadAsync("client-file-only"));
+        Assert.True(File.Exists(unrelatedPath));
+        Assert.Equal(0, await store.ClearAsync());
+    }
+
+    [Fact]
+    public async Task AutoMode_ClearAsync_WhenOsStoreUnavailable_FallsBackToFileStoreAndWarnsOnce()
+    {
+        var osStore = new FakeOsStore
+        {
+            OnClear = () => new CredentialStoreUnavailableException("daemon unavailable"),
+        };
+        var fileStore = new FileRefreshTokenStore(_tempDir);
+        await fileStore.SaveAsync("client-1", "rt-1");
+        await fileStore.SaveAsync("client-2", "rt-2");
+
+        using var errWriter = new StringWriter();
+        var logger = new StderrLogger(AppLogLevel.Warn, LogOutputMode.Stderr, errWriter);
+        var store = new RefreshTokenStore(TokenStoreMode.Auto, osStore, fileStore, logger);
+
+        var result = await store.ClearDetailedAsync();
+        Assert.Equal(2, result.DeletedCount);
+        Assert.Equal(0, result.OsDeletedCount);
+        Assert.Equal(2, result.FileDeletedCount);
+        Assert.True(result.OsUnavailableFallback);
+        Assert.Null(await fileStore.LoadAsync("client-1"));
+        Assert.Null(await fileStore.LoadAsync("client-2"));
+
+        var stderr = errWriter.ToString();
+        var warningCount = stderr.Split("OS credential store unavailable", StringSplitOptions.None).Length - 1;
+        Assert.Equal(1, warningCount);
     }
 
     [Fact]
@@ -166,37 +240,76 @@ public sealed class RefreshTokenStoreTests : IDisposable
         Assert.Null(await emptyStrictStore.LoadAsync("client-os"));
         Assert.True(File.Exists(legacyPath));
 
-        // When OS store is unavailable, strict OS mode throws AuthException on Load/Save/Delete.
+        // Clearing strict OS mode must only clear OS store and leave legacy files untouched.
+        await emptyOs.SaveAsync("os-1", "rt-os-1");
+        var osClear = await emptyStrictStore.ClearDetailedAsync();
+        Assert.Equal(1, osClear.DeletedCount);
+        Assert.Equal(1, osClear.OsDeletedCount);
+        Assert.Equal(0, osClear.FileDeletedCount);
+        Assert.Null(osClear.FileBackend);
+        Assert.True(File.Exists(legacyPath));
+
+        // When OS store is unavailable, strict OS mode throws AuthException on Load/Save/Delete/Clear.
         var brokenOs = new FakeOsStore
         {
             OnLoad = _ => new CredentialStoreUnavailableException("no session"),
             OnSave = (_, _) => new CredentialStoreUnavailableException("no session"),
             OnDelete = _ => new CredentialStoreUnavailableException("no session"),
+            OnClear = () => new CredentialStoreUnavailableException("no session"),
         };
         var strictStore = new RefreshTokenStore(TokenStoreMode.Os, brokenOs, fileStore);
 
         await Assert.ThrowsAsync<AuthException>(() => strictStore.LoadAsync("client-os").AsTask());
         await Assert.ThrowsAsync<AuthException>(() => strictStore.SaveAsync("client-os", "new-rt").AsTask());
         await Assert.ThrowsAsync<AuthException>(() => strictStore.DeleteAsync("client-os").AsTask());
+        await Assert.ThrowsAsync<AuthException>(() => strictStore.ClearAsync().AsTask());
         Assert.Equal("legacy-only", await fileStore.LoadAsync("client-os"));
     }
 
     [Fact]
-    public async Task FileMode_NeverCallsOsStore_AndDeletesCleanly()
+    public async Task FileMode_NeverCallsOsStore_AndDeletesAndClearsCleanly()
     {
         var osStore = new FakeOsStore
         {
             OnLoad = _ => throw new InvalidOperationException("OS store should not be called"),
             OnSave = (_, _) => throw new InvalidOperationException("OS store should not be called"),
             OnDelete = _ => throw new InvalidOperationException("OS store should not be called"),
+            OnClear = () => throw new InvalidOperationException("OS store should not be called"),
         };
         var fileStore = new FileRefreshTokenStore(_tempDir);
         var store = new RefreshTokenStore(TokenStoreMode.File, osStore, fileStore);
 
         await store.SaveAsync("client-file", "file-rt");
         Assert.Equal("file-rt", await store.LoadAsync("client-file"));
-        await store.DeleteAsync("client-file");
+        Assert.True(await store.DeleteAsync("client-file"));
+        Assert.False(await store.DeleteAsync("client-file"));
         Assert.Null(await store.LoadAsync("client-file"));
+
+        await store.SaveAsync("client-a", "rt-a");
+        await store.SaveAsync("client-b", "rt-b");
+        var cleared = await store.ClearDetailedAsync();
+        Assert.Equal(2, cleared.DeletedCount);
+        Assert.Null(cleared.OsBackend);
+        Assert.Equal(fileStore.BackendName, cleared.FileBackend);
+        Assert.Equal(0, await store.ClearAsync());
+    }
+
+    [Fact]
+    public async Task FileRefreshTokenStore_ClearAsync_HandlesMissingDirectoryAndPreservesUnrelatedFiles()
+    {
+        var missingDirStore = new FileRefreshTokenStore(Path.Combine(_tempDir, "nonexistent"));
+        Assert.Equal(0, await missingDirStore.ClearAsync());
+
+        var fileStore = new FileRefreshTokenStore(_tempDir);
+        await fileStore.SaveAsync("c1", "rt1");
+        await fileStore.SaveAsync("c2", "rt2");
+        var unrelated = Path.Combine(_tempDir, "notes.txt");
+        await File.WriteAllTextAsync(unrelated, "keep");
+
+        Assert.Equal(2, await fileStore.ClearAsync());
+        Assert.Null(await fileStore.LoadAsync("c1"));
+        Assert.Null(await fileStore.LoadAsync("c2"));
+        Assert.True(File.Exists(unrelated));
     }
 
     [Fact]
@@ -243,7 +356,8 @@ public sealed class RefreshTokenStoreTests : IDisposable
         await fileStore.SaveAsync("dpapi-client", "dpapi-secret-value-2");
         Assert.Equal("dpapi-secret-value-2", await fileStore.LoadAsync("dpapi-client"));
 
-        await fileStore.DeleteAsync("dpapi-client");
+        Assert.True(await fileStore.DeleteAsync("dpapi-client"));
+        Assert.False(await fileStore.DeleteAsync("dpapi-client"));
         Assert.False(File.Exists(path));
         Assert.Null(await fileStore.LoadAsync("dpapi-client"));
     }

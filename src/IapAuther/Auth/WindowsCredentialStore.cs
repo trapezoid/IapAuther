@@ -154,7 +154,7 @@ internal sealed class WindowsCredentialStore : IRefreshTokenStore
         return ValueTask.CompletedTask;
     }
 
-    public ValueTask DeleteAsync(string clientId, CancellationToken cancellationToken = default)
+    public ValueTask<bool> DeleteAsync(string clientId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentException.ThrowIfNullOrWhiteSpace(clientId);
@@ -165,12 +165,88 @@ internal sealed class WindowsCredentialStore : IRefreshTokenStore
             var err = Marshal.GetLastPInvokeError();
             if (err == ErrorNotFound)
             {
-                return ValueTask.CompletedTask;
+                return new ValueTask<bool>(false);
             }
             throw MapWin32Error(err, "CredDeleteW");
         }
 
-        return ValueTask.CompletedTask;
+        return new ValueTask<bool>(true);
+    }
+
+    public ValueTask<int> ClearAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var filter = $"{_targetPrefix}:*";
+        if (!CredEnumerateW(filter, 0, out var count, out var credentialsPtr))
+        {
+            var err = Marshal.GetLastPInvokeError();
+            if (err == ErrorNotFound)
+            {
+                return new ValueTask<int>(0);
+            }
+            throw MapWin32Error(err, "CredEnumerateW");
+        }
+
+        var targets = new List<string>();
+        var requiredPrefix = $"{_targetPrefix}:";
+        try
+        {
+            if (credentialsPtr != nint.Zero && count > 0)
+            {
+                var itemCount = checked((int)count);
+                targets.Capacity = itemCount;
+                for (var i = 0; i < itemCount; i++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var credPtr = Marshal.ReadIntPtr(credentialsPtr, i * nint.Size);
+                    if (credPtr == nint.Zero)
+                    {
+                        continue;
+                    }
+
+                    var cred = Marshal.PtrToStructure<NativeCredential>(credPtr);
+                    if (cred.Type != CredTypeGeneric || cred.TargetName == nint.Zero)
+                    {
+                        continue;
+                    }
+
+                    var targetName = Marshal.PtrToStringUni(cred.TargetName);
+                    if (!string.IsNullOrEmpty(targetName) &&
+                        targetName.StartsWith(requiredPrefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        targets.Add(targetName);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            if (credentialsPtr != nint.Zero)
+            {
+                CredFree(credentialsPtr);
+            }
+        }
+
+        var deleted = 0;
+        foreach (var targetName in targets)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (CredDeleteW(targetName, CredTypeGeneric, 0))
+            {
+                deleted++;
+            }
+            else
+            {
+                var err = Marshal.GetLastPInvokeError();
+                if (err != ErrorNotFound)
+                {
+                    throw MapWin32Error(err, "CredDeleteW");
+                }
+            }
+        }
+
+        return new ValueTask<int>(deleted);
     }
 
     private string FormatTargetName(string clientId) => $"{_targetPrefix}:{clientId}";
@@ -208,6 +284,10 @@ internal sealed class WindowsCredentialStore : IRefreshTokenStore
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CredReadW(string targetName, uint type, uint flags, out nint credential);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CredEnumerateW(string? filter, uint flags, out uint count, out nint credentials);
 
     [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

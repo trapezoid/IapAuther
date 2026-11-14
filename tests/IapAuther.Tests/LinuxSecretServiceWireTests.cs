@@ -118,14 +118,43 @@ public sealed class LinuxSecretServiceWireTests : IAsyncLifetime
         Assert.Equal("rt-updated-日本語", await store.LoadAsync("client-a"));
         Assert.Equal(2, _handler.ItemCount);
 
-        await store.DeleteAsync("client-a");
+        Assert.True(await store.DeleteAsync("client-a"));
         Assert.Null(await store.LoadAsync("client-a"));
         Assert.Equal("rt-other-account", await store.LoadAsync("client-b"));
 
-        // Deleting a non-existent entry is a no-op.
-        await store.DeleteAsync("client-a");
+        // Deleting a non-existent entry is a no-op returning false.
+        Assert.False(await store.DeleteAsync("client-a"));
         Assert.Equal(1, _handler.ItemCount);
         Assert.True(_handler.ClosedSessionCount >= 6);
+    }
+
+    [Fact]
+    public async Task SecretService_ClearAsync_DeletesAllOwnedItemsAndPreservesOtherApplications_OverRealDBusDaemon()
+    {
+        if (!OperatingSystem.IsLinux() || _handler is null || _busAddress is null)
+        {
+            return;
+        }
+
+        IRefreshTokenStore store = new LinuxSecretServiceStore(serviceName: "iap-auther-wire-test", dbusAddress: _busAddress);
+        IRefreshTokenStore otherAppStore = new LinuxSecretServiceStore(serviceName: "other-app", dbusAddress: _busAddress);
+
+        await store.SaveAsync("client-a", "rt-a");
+        await store.SaveAsync("client-b", "rt-b");
+        await store.SaveAsync("client-c", "rt-c");
+        await otherAppStore.SaveAsync("client-x", "other-secret");
+        Assert.Equal(4, _handler.ItemCount);
+
+        var deleted = await store.ClearAsync();
+        Assert.Equal(3, deleted);
+        Assert.Equal(1, _handler.ItemCount);
+        Assert.Null(await store.LoadAsync("client-a"));
+        Assert.Null(await store.LoadAsync("client-b"));
+        Assert.Null(await store.LoadAsync("client-c"));
+        Assert.Equal("other-secret", await otherAppStore.LoadAsync("client-x"));
+
+        // Repeated clear is idempotent.
+        Assert.Equal(0, await store.ClearAsync());
     }
 
     [Fact]
@@ -142,6 +171,7 @@ public sealed class LinuxSecretServiceWireTests : IAsyncLifetime
         await Assert.ThrowsAsync<CredentialStoreUnavailableException>(() => store.LoadAsync("client-a").AsTask());
         await Assert.ThrowsAsync<CredentialStoreUnavailableException>(() => store.SaveAsync("client-a", "rt").AsTask());
         await Assert.ThrowsAsync<CredentialStoreUnavailableException>(() => store.DeleteAsync("client-a").AsTask());
+        await Assert.ThrowsAsync<CredentialStoreUnavailableException>(() => store.ClearAsync().AsTask());
     }
 
     [Fact]

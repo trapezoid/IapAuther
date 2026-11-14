@@ -40,11 +40,16 @@ internal sealed class FileRefreshTokenStore : IRefreshTokenStore
         return ValueTask.CompletedTask;
     }
 
-    public ValueTask DeleteAsync(string clientId, CancellationToken cancellationToken = default)
+    public ValueTask<bool> DeleteAsync(string clientId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        Delete(clientId);
-        return ValueTask.CompletedTask;
+        return new ValueTask<bool>(Delete(clientId));
+    }
+
+    public ValueTask<int> ClearAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return new ValueTask<int>(Clear(cancellationToken));
     }
 
     public string? Load(string clientId)
@@ -146,13 +151,48 @@ internal sealed class FileRefreshTokenStore : IRefreshTokenStore
         }
     }
 
-    public void Delete(string clientId)
+    public bool Delete(string clientId)
     {
         var path = GetTokenPath(clientId);
-        if (File.Exists(path))
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+
+        try
         {
             File.Delete(path);
+            return true;
         }
+        catch (FileNotFoundException)
+        {
+            return false;
+        }
+    }
+
+    public int Clear(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!Directory.Exists(_directory))
+        {
+            return 0;
+        }
+
+        var deleted = 0;
+        foreach (var path in Directory.EnumerateFiles(_directory, "refresh-token-*"))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                File.Delete(path);
+                deleted++;
+            }
+            catch (FileNotFoundException)
+            {
+                // Concurrent delete.
+            }
+        }
+        return deleted;
     }
 
     [SupportedOSPlatform("windows")]

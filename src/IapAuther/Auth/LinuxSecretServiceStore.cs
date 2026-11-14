@@ -88,7 +88,7 @@ internal sealed class LinuxSecretServiceStore : IRefreshTokenStore
         }
     }
 
-    public async ValueTask DeleteAsync(string clientId, CancellationToken cancellationToken = default)
+    public async ValueTask<bool> DeleteAsync(string clientId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentException.ThrowIfNullOrWhiteSpace(clientId);
@@ -96,15 +96,44 @@ internal sealed class LinuxSecretServiceStore : IRefreshTokenStore
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         cts.CancelAfter(_timeout);
 
-        await ExecuteWithSessionAsync(
+        return await ExecuteWithSessionAsync(
             async (connection, _, collectionPath, ct) =>
             {
                 var items = await SearchItemsAsync(connection, collectionPath, clientId, ct).ConfigureAwait(false);
+                var deleted = 0;
                 foreach (var itemPath in items)
                 {
-                    await DeleteItemAsync(connection, itemPath.ToString(), ct).ConfigureAwait(false);
+                    if (await DeleteItemAsync(connection, itemPath.ToString(), ct).ConfigureAwait(false))
+                    {
+                        deleted++;
+                    }
                 }
-                return 0;
+                return deleted > 0;
+            },
+            cts.Token,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<int> ClearAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(_timeout);
+
+        return await ExecuteWithSessionAsync(
+            async (connection, _, collectionPath, ct) =>
+            {
+                var items = await SearchItemsAsync(connection, collectionPath, clientId: null, ct).ConfigureAwait(false);
+                var deleted = 0;
+                foreach (var itemPath in items)
+                {
+                    if (await DeleteItemAsync(connection, itemPath.ToString(), ct).ConfigureAwait(false))
+                    {
+                        deleted++;
+                    }
+                }
+                return deleted;
             },
             cts.Token,
             cancellationToken).ConfigureAwait(false);
@@ -272,7 +301,7 @@ internal sealed class LinuxSecretServiceStore : IRefreshTokenStore
     private Task<ObjectPath[]> SearchItemsAsync(
         DBusConnection connection,
         string collectionPath,
-        string clientId,
+        string? clientId,
         CancellationToken cancellationToken)
     {
         return connection.CallMethodAsync(
@@ -288,7 +317,7 @@ internal sealed class LinuxSecretServiceStore : IRefreshTokenStore
             DBusConnection conn,
             string path,
             string serviceName,
-            string accountId)
+            string? accountId)
         {
             using var writer = conn.GetMessageWriter();
             writer.WriteMethodCallHeader(
@@ -303,9 +332,12 @@ internal sealed class LinuxSecretServiceStore : IRefreshTokenStore
             writer.WriteDictionaryEntryStart();
             writer.WriteString("application");
             writer.WriteString(serviceName);
-            writer.WriteDictionaryEntryStart();
-            writer.WriteString("account");
-            writer.WriteString(accountId);
+            if (accountId is not null)
+            {
+                writer.WriteDictionaryEntryStart();
+                writer.WriteString("account");
+                writer.WriteString(accountId);
+            }
             writer.WriteDictionaryEntryStart();
             writer.WriteString("xdg:schema");
             writer.WriteString(SchemaName);
@@ -423,25 +455,37 @@ internal sealed class LinuxSecretServiceStore : IRefreshTokenStore
         }
     }
 
-    private static async Task DeleteItemAsync(
+    private static async Task<bool> DeleteItemAsync(
         DBusConnection connection,
         string itemPath,
         CancellationToken cancellationToken)
     {
-        var promptPath = await connection.CallMethodAsync(
-            CreateDeleteMessage(connection, itemPath),
-            static (Message message, object? _) =>
-            {
-                var reader = message.GetBodyReader();
-                return reader.ReadObjectPathAsString();
-            },
-            null).WaitAsync(cancellationToken).ConfigureAwait(false);
+        string promptPath;
+        try
+        {
+            promptPath = await connection.CallMethodAsync(
+                CreateDeleteMessage(connection, itemPath),
+                static (Message message, object? _) =>
+                {
+                    var reader = message.GetBodyReader();
+                    return reader.ReadObjectPathAsString();
+                },
+                null).WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (DBusErrorReplyException ex) when (ex.ErrorName is
+            "org.freedesktop.Secret.Error.NoSuchObject"
+            or "org.freedesktop.DBus.Error.UnknownObject")
+        {
+            return false;
+        }
 
         if (!string.IsNullOrEmpty(promptPath) && promptPath != "/")
         {
             throw new CredentialStoreUnavailableException(
                 "Secret Service requested interactive prompt to delete secret.");
         }
+
+        return true;
 
         static MessageBuffer CreateDeleteMessage(DBusConnection conn, string path)
         {

@@ -174,7 +174,7 @@ internal sealed class MacOSKeychainStore : IRefreshTokenStore
         return ValueTask.CompletedTask;
     }
 
-    public ValueTask DeleteAsync(string clientId, CancellationToken cancellationToken = default)
+    public ValueTask<bool> DeleteAsync(string clientId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentException.ThrowIfNullOrWhiteSpace(clientId);
@@ -182,47 +182,120 @@ internal sealed class MacOSKeychainStore : IRefreshTokenStore
         var serviceBytes = Encoding.UTF8.GetBytes(_serviceName);
         var accountBytes = Encoding.UTF8.GetBytes(clientId);
 
-        ExecuteNonInteractive(keychainRef =>
+        var deleted = ExecuteNonInteractive(keychainRef =>
         {
-            var status = SecKeychainFindGenericPasswordItemRef(
-                keychainRef,
-                (uint)serviceBytes.Length,
-                serviceBytes,
-                (uint)accountBytes.Length,
-                accountBytes,
-                nint.Zero,
-                nint.Zero,
-                out var itemRef);
+            const int maxIterations = 10_000;
+            var removed = 0;
 
-            if (status == ErrSecItemNotFound)
+            for (var iteration = 0; iteration < maxIterations; iteration++)
             {
-                return 0;
-            }
-            if (status != ErrSecSuccess)
-            {
-                throw MapSecError(status, "SecKeychainFindGenericPassword(delete)");
-            }
+                cancellationToken.ThrowIfCancellationRequested();
+                var status = SecKeychainFindGenericPasswordItemRef(
+                    keychainRef,
+                    (uint)serviceBytes.Length,
+                    serviceBytes,
+                    (uint)accountBytes.Length,
+                    accountBytes,
+                    nint.Zero,
+                    nint.Zero,
+                    out var itemRef);
 
-            try
-            {
-                status = SecKeychainItemDelete(itemRef);
-                if (status != ErrSecSuccess && status != ErrSecItemNotFound)
+                if (status == ErrSecItemNotFound)
                 {
-                    throw MapSecError(status, "SecKeychainItemDelete");
+                    return removed > 0;
+                }
+                if (status != ErrSecSuccess)
+                {
+                    throw MapSecError(status, "SecKeychainFindGenericPassword(delete)");
+                }
+
+                try
+                {
+                    status = SecKeychainItemDelete(itemRef);
+                    if (status == ErrSecItemNotFound)
+                    {
+                        continue;
+                    }
+                    if (status != ErrSecSuccess)
+                    {
+                        throw MapSecError(status, "SecKeychainItemDelete");
+                    }
+                    removed++;
+                }
+                finally
+                {
+                    if (itemRef != nint.Zero)
+                    {
+                        CFRelease(itemRef);
+                    }
                 }
             }
-            finally
-            {
-                if (itemRef != nint.Zero)
-                {
-                    CFRelease(itemRef);
-                }
-            }
 
-            return 0;
+            throw new InvalidOperationException("Exceeded maximum iteration count while deleting macOS Keychain items.");
         });
 
-        return ValueTask.CompletedTask;
+        return new ValueTask<bool>(deleted);
+    }
+
+    public ValueTask<int> ClearAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var serviceBytes = Encoding.UTF8.GetBytes(_serviceName);
+
+        var deletedCount = ExecuteNonInteractive(keychainRef =>
+        {
+            const int maxIterations = 10_000;
+            var removed = 0;
+
+            for (var iteration = 0; iteration < maxIterations; iteration++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var status = SecKeychainFindGenericPasswordByServiceItemRef(
+                    keychainRef,
+                    (uint)serviceBytes.Length,
+                    serviceBytes,
+                    0,
+                    nint.Zero,
+                    nint.Zero,
+                    nint.Zero,
+                    out var itemRef);
+
+                if (status == ErrSecItemNotFound)
+                {
+                    return removed;
+                }
+                if (status != ErrSecSuccess)
+                {
+                    throw MapSecError(status, "SecKeychainFindGenericPassword(clear)");
+                }
+
+                try
+                {
+                    status = SecKeychainItemDelete(itemRef);
+                    if (status == ErrSecItemNotFound)
+                    {
+                        continue;
+                    }
+                    if (status != ErrSecSuccess)
+                    {
+                        throw MapSecError(status, "SecKeychainItemDelete");
+                    }
+                    removed++;
+                }
+                finally
+                {
+                    if (itemRef != nint.Zero)
+                    {
+                        CFRelease(itemRef);
+                    }
+                }
+            }
+
+            throw new InvalidOperationException("Exceeded maximum iteration count while clearing macOS Keychain items.");
+        });
+
+        return new ValueTask<int>(deletedCount);
     }
 
     private T ExecuteNonInteractive<T>(Func<nint, T> action)
@@ -377,6 +450,17 @@ internal sealed class MacOSKeychainStore : IRefreshTokenStore
         byte[] serviceName,
         uint accountNameLength,
         byte[] accountName,
+        nint passwordLengthMustBeZero,
+        nint passwordDataMustBeZero,
+        out nint itemRef);
+
+    [DllImport(SecurityFramework, EntryPoint = "SecKeychainFindGenericPassword")]
+    private static extern int SecKeychainFindGenericPasswordByServiceItemRef(
+        nint keychainOrArray,
+        uint serviceNameLength,
+        byte[] serviceName,
+        uint accountNameLengthMustBeZero,
+        nint accountNameMustBeZero,
         nint passwordLengthMustBeZero,
         nint passwordDataMustBeZero,
         out nint itemRef);

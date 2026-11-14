@@ -45,6 +45,8 @@ internal sealed class RefreshTokenStore : IRefreshTokenStore
             ? _fileStore.BackendName
             : _osStore.BackendName;
 
+    public string FileDirectory => _fileStore.DirectoryPath;
+
     public string GetTokenPath(string clientId) => _fileStore.GetTokenPath(clientId);
 
     public string? Load(string clientId) =>
@@ -53,8 +55,11 @@ internal sealed class RefreshTokenStore : IRefreshTokenStore
     public void Save(string clientId, string refreshToken) =>
         SaveAsync(clientId, refreshToken).AsTask().GetAwaiter().GetResult();
 
-    public void Delete(string clientId) =>
+    public bool Delete(string clientId) =>
         DeleteAsync(clientId).AsTask().GetAwaiter().GetResult();
+
+    public int Clear() =>
+        ClearAsync().AsTask().GetAwaiter().GetResult();
 
     public async ValueTask<string?> LoadAsync(string clientId, CancellationToken cancellationToken = default)
     {
@@ -165,9 +170,42 @@ internal sealed class RefreshTokenStore : IRefreshTokenStore
         }
     }
 
-    public async ValueTask DeleteAsync(string clientId, CancellationToken cancellationToken = default)
+    public async ValueTask<bool> DeleteAsync(string clientId, CancellationToken cancellationToken = default)
+    {
+        var result = await DeleteDetailedAsync(clientId, cancellationToken).ConfigureAwait(false);
+        return result.DeletedCount > 0;
+    }
+
+    public async ValueTask<int> ClearAsync(CancellationToken cancellationToken = default)
+    {
+        var result = await ClearDetailedAsync(cancellationToken).ConfigureAwait(false);
+        return result.DeletedCount;
+    }
+
+    internal Task<TokenClearResult> DeleteDetailedAsync(string clientId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(clientId);
+        return ExecuteClearAsync(
+            async store => await store.DeleteAsync(clientId, cancellationToken).ConfigureAwait(false) ? 1 : 0,
+            cancellationToken);
+    }
+
+    internal Task<TokenClearResult> ClearDetailedAsync(CancellationToken cancellationToken = default) =>
+        ExecuteClearAsync(
+            async store => await store.ClearAsync(cancellationToken).ConfigureAwait(false),
+            cancellationToken);
+
+    private async Task<TokenClearResult> ExecuteClearAsync(
+        Func<IRefreshTokenStore, Task<int>> clearOperation,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var osDeleted = 0;
+        var fileDeleted = 0;
+        var osUnavailableFallback = false;
+        string? osBackend = null;
+        string? fileBackend = null;
 
         if (_mode != TokenStoreMode.File)
         {
@@ -177,12 +215,15 @@ internal sealed class RefreshTokenStore : IRefreshTokenStore
                 {
                     throw new AuthException("No native OS credential store backend is available on this platform.");
                 }
+                osUnavailableFallback = true;
+                LogFallbackOnce("none", "no native OS credential store backend is available on this platform");
             }
             else
             {
+                osBackend = _osStore.BackendName;
                 try
                 {
-                    await _osStore.DeleteAsync(clientId, cancellationToken).ConfigureAwait(false);
+                    osDeleted = await clearOperation(_osStore).ConfigureAwait(false);
                 }
                 catch (CredentialStoreUnavailableException ex)
                 {
@@ -192,6 +233,7 @@ internal sealed class RefreshTokenStore : IRefreshTokenStore
                             $"OS credential store ({_osStore.BackendName}) is unavailable: {ex.Message}",
                             ex);
                     }
+                    osUnavailableFallback = true;
                     LogFallbackOnce(_osStore.BackendName, ex.Message);
                 }
             }
@@ -199,8 +241,17 @@ internal sealed class RefreshTokenStore : IRefreshTokenStore
 
         if (_mode != TokenStoreMode.Os)
         {
-            await _fileStore.DeleteAsync(clientId, cancellationToken).ConfigureAwait(false);
+            fileBackend = _fileStore.BackendName;
+            fileDeleted = await clearOperation(_fileStore).ConfigureAwait(false);
         }
+
+        return new TokenClearResult(
+            DeletedCount: osDeleted + fileDeleted,
+            OsDeletedCount: osDeleted,
+            FileDeletedCount: fileDeleted,
+            OsBackend: osBackend,
+            FileBackend: fileBackend,
+            OsUnavailableFallback: osUnavailableFallback);
     }
 
     internal static IRefreshTokenStore? CreatePlatformOsStore()
@@ -244,3 +295,11 @@ internal sealed class RefreshTokenStore : IRefreshTokenStore
         }
     }
 }
+
+internal sealed record TokenClearResult(
+    int DeletedCount,
+    int OsDeletedCount,
+    int FileDeletedCount,
+    string? OsBackend,
+    string? FileBackend,
+    bool OsUnavailableFallback);

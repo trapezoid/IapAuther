@@ -8,5 +8,7 @@ internal interface IRefreshTokenStore
 
     ValueTask SaveAsync(string clientId, string refreshToken, CancellationToken cancellationToken = default);
 
-    ValueTask DeleteAsync(string clientId, CancellationToken cancellationToken = default);
+    ValueTask<bool> DeleteAsync(string clientId, CancellationToken cancellationToken = default);
+
+    ValueTask<int> ClearAsync(CancellationToken cancellationToken = default);
 }

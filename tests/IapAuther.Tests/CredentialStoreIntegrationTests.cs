@@ -42,7 +42,8 @@ public sealed class CredentialStoreIntegrationTests : IDisposable
         if (OperatingSystem.IsWindows())
         {
             var backend = new WindowsCredentialStore(targetPrefix: $"iap-auther-test-{runId}");
-            await ExerciseBackendAndCoordinatorAsync(backend, clientA, clientB, requireAvailable: true);
+            var otherBackend = new WindowsCredentialStore(targetPrefix: $"iap-auther-test-other-{runId}");
+            await ExerciseBackendAndCoordinatorAsync(backend, clientA, clientB, requireAvailable: true, otherBackend);
             return;
         }
 
@@ -50,13 +51,15 @@ public sealed class CredentialStoreIntegrationTests : IDisposable
         {
             var serviceName = $"iap-auther-test-{runId}";
             var defaultBackend = new MacOSKeychainStore(serviceName: serviceName);
-            await ExerciseBackendAndCoordinatorAsync(defaultBackend, clientA, clientB, requireAvailable: RequireOsStoreTests);
+            var defaultOther = new MacOSKeychainStore(serviceName: $"{serviceName}-other");
+            await ExerciseBackendAndCoordinatorAsync(defaultBackend, clientA, clientB, requireAvailable: RequireOsStoreTests, defaultOther);
 
             var explicitKeychain = Environment.GetEnvironmentVariable("IAP_AUTHER_TEST_MACOS_KEYCHAIN");
             if (!string.IsNullOrWhiteSpace(explicitKeychain))
             {
                 var explicitBackend = new MacOSKeychainStore(serviceName: $"{serviceName}-explicit", keychainPath: explicitKeychain);
-                await ExerciseBackendAndCoordinatorAsync(explicitBackend, clientA, clientB, requireAvailable: true);
+                var explicitOther = new MacOSKeychainStore(serviceName: $"{serviceName}-explicit-other", keychainPath: explicitKeychain);
+                await ExerciseBackendAndCoordinatorAsync(explicitBackend, clientA, clientB, requireAvailable: true, explicitOther);
             }
 
             // Verify missing explicit keychain cleanly reports unavailability without prompting.
@@ -70,7 +73,8 @@ public sealed class CredentialStoreIntegrationTests : IDisposable
         if (OperatingSystem.IsLinux())
         {
             var backend = new LinuxSecretServiceStore(serviceName: $"iap-auther-test-{runId}");
-            await ExerciseBackendAndCoordinatorAsync(backend, clientA, clientB, requireAvailable: RequireOsStoreTests);
+            var otherBackend = new LinuxSecretServiceStore(serviceName: $"iap-auther-test-other-{runId}");
+            await ExerciseBackendAndCoordinatorAsync(backend, clientA, clientB, requireAvailable: RequireOsStoreTests, otherBackend);
         }
     }
 
@@ -78,8 +82,10 @@ public sealed class CredentialStoreIntegrationTests : IDisposable
         IRefreshTokenStore backend,
         string clientA,
         string clientB,
-        bool requireAvailable)
+        bool requireAvailable,
+        IRefreshTokenStore? isolatedOtherServiceStore = null)
     {
+        const string otherClient = "iap-auther-other-client";
         try
         {
             // Verify initial missing state.
@@ -96,7 +102,8 @@ public sealed class CredentialStoreIntegrationTests : IDisposable
             Assert.Equal("rt-rotated-日本語", await backend.LoadAsync(clientA));
 
             // Delete and verify missing again.
-            await backend.DeleteAsync(clientA);
+            Assert.True(await backend.DeleteAsync(clientA));
+            Assert.False(await backend.DeleteAsync(clientA));
             Assert.Null(await backend.LoadAsync(clientA));
             Assert.Equal("rt-second-client", await backend.LoadAsync(clientB));
 
@@ -112,8 +119,27 @@ public sealed class CredentialStoreIntegrationTests : IDisposable
             var strictCoordinator = new RefreshTokenStore(TokenStoreMode.Os, backend, fileStore);
             await strictCoordinator.SaveAsync(clientA, "strict-os-rt");
             Assert.Equal("strict-os-rt", await strictCoordinator.LoadAsync(clientA));
-            await strictCoordinator.DeleteAsync(clientA);
+            Assert.True(await strictCoordinator.DeleteAsync(clientA));
             Assert.Null(await strictCoordinator.LoadAsync(clientA));
+
+            // Exercise ClearAsync only on isolated test-scoped stores (never on shared default platform service).
+            if (isolatedOtherServiceStore is not null)
+            {
+                await backend.SaveAsync(clientA, "rt-clear-1");
+                await backend.SaveAsync(clientB, "rt-clear-2");
+                await fileStore.SaveAsync("legacy-clear-only", "rt-legacy");
+                await isolatedOtherServiceStore.SaveAsync(otherClient, "rt-other-service");
+
+                var clearResult = await coordinator.ClearDetailedAsync();
+                Assert.Equal(3, clearResult.DeletedCount);
+                Assert.Equal(2, clearResult.OsDeletedCount);
+                Assert.Equal(1, clearResult.FileDeletedCount);
+                Assert.Null(await backend.LoadAsync(clientA));
+                Assert.Null(await backend.LoadAsync(clientB));
+                Assert.Null(await fileStore.LoadAsync("legacy-clear-only"));
+                Assert.Equal("rt-other-service", await isolatedOtherServiceStore.LoadAsync(otherClient));
+                Assert.Equal(0, await backend.ClearAsync());
+            }
         }
         catch (CredentialStoreUnavailableException) when (!requireAvailable)
         {
@@ -126,6 +152,10 @@ public sealed class CredentialStoreIntegrationTests : IDisposable
             {
                 await backend.DeleteAsync(clientA);
                 await backend.DeleteAsync(clientB);
+                if (isolatedOtherServiceStore is not null)
+                {
+                    await isolatedOtherServiceStore.DeleteAsync(otherClient);
+                }
             }
             catch
             {

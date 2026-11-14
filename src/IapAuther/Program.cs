@@ -41,6 +41,7 @@ internal static class Program
         root.Add(TokenCommand.Create(output, error));
         root.Add(HeadersCommand.Create(output, error));
         root.Add(McpProxyCommand.Create(output, error));
+        root.Add(LogoutCommand.Create(output, error));
 
         var parseResult = root.Parse(args);
         var invocationConfig = (output is not null || error is not null)

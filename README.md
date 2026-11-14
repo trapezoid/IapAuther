@@ -5,6 +5,7 @@ Google Cloud Identity-Aware Proxy (Cloud IAP) でのさまざまな認証に対�
 - **トークン発行 (`token`)**: OIDC ID トークンや自己署名サービスアカウント JWT を発行して標準出力へ出力 (`curl` 等との連携に最適)
 - **headersHelper 用 JSON 出力 (`headers`)**: `Proxy-Authorization` と任意の追加ヘッダ (`-H` / `--header`) を含む JSON オブジェクトを標準出力へ出力 (Claude Code 等の `headersHelper` 向け)
 - **MCP Proxy (`mcp-proxy`)**: stdio クライアント (Claude Desktop / Claude Code / Cursor 等) と IAP 保護された HTTP MCP サーバー (Streamable HTTP / Legacy HTTP+SSE) を公式 [MCP C# SDK](https://github.com/modelcontextprotocol/csharp-sdk) (`ModelContextProtocol.Core`) 経由でつなぐブリッジ
+- **クレデンシャルストアのクリア (`logout` / `clear-tokens`)**: 各 OS のクレデンシャルストアおよび従来ファイルストアに保存された OAuth リフレッシュトークンを削除
 
 ## 必要環境
 
@@ -156,6 +157,37 @@ Direct Cloud Run IAP (Google-managed OAuth クライアント) の場合:
 }
 ```
 
+---
+
+### 4. クレデンシャルストアのクリア (`logout` / `clear-tokens`)
+
+OAuth 認証で保存されたリフレッシュトークンは、`iap-auther logout`（エイリアス: `clear-tokens`）で各 OS クレデンシャルストアおよび従来ファイルストアから削除できます。
+
+```sh
+# 特定の OAuth クライアント ID に紐づくトークンのみ削除 (--oauth-client-id または IAP_AUTHER_OAUTH_CLIENT_ID)
+iap-auther logout --oauth-client-id 1234567890-abc.apps.googleusercontent.com
+
+# IapAuther が保存したすべての OAuth リフレッシュトークンを一括削除
+iap-auther logout --all
+
+# 削除対象ストアを明示して JSON で結果を表示 (--token-store: auto / os / file)
+iap-auther logout --all --token-store os --format json
+```
+
+- `--token-store auto`（デフォルト）では、OS クレデンシャルストアと従来ファイルストア（Windows: `%APPDATA%\iap-auther` の `.dpapi` ファイル / Linux・macOS: `~/.config/iap-auther` 等）の両方から削除します（OS ストア利用不可時は警告を出してファイルストアのみ削除）。
+- `--token-store os` は OS クレデンシャルストアのみを対象とし、利用不可時は終了コード `2` で失敗します。
+- 該当トークンが 0 件の場合もエラーにはならず、冪等に終了コード `0` で完了します（`gcloud` の ADC やサービスアカウントキー自体は削除しません）。
+
+<details>
+<summary>OS 標準ツールで手動確認・削除する場合の格納キー仕様</summary>
+
+- **Windows (資格情報マネージャー)**: 汎用資格情報 `TargetName = iap-auther:oauth-refresh-token:<CLIENT_ID>`（`cmdkey /list` や コントロールパネルで確認可）
+- **macOS (Keychain)**: 汎用パスワード `service = iap-auther`, `account = <CLIENT_ID>`（`security find-generic-password -s iap-auther` / キーチェーンアクセスで確認可）
+- **Linux (Secret Service / GNOME Keyring 等)**: 属性 `application=iap-auther`, `account=<CLIENT_ID>`, `xdg:schema=org.iapauther.OAuthRefreshToken`（`secret-tool search application iap-auther xdg:schema org.iapauther.OAuthRefreshToken` で確認可）
+- **ファイルストア (`--token-store file` / フォールバック)**: `refresh-token-<CLIENT_ID>`（Windows は `.dpapi` 拡張子）
+
+</details>
+
 ## 対応する認証パターン (`--credentials`)
 
 | モード | トークン種別 | 仕組み / 用途 |
@@ -176,11 +208,12 @@ Direct Cloud Run IAP (Google-managed OAuth クライアント) の場合:
 | `--credential-file` | `IAP_AUTHER_CREDENTIAL_FILE` | — | SA JSON キーまたは ADC ファイルのパス |
 | `--oauth-client-id` | `IAP_AUTHER_OAUTH_CLIENT_ID` / `IAP_MCP_OAUTH_CLIENT_ID` | — | デスクトップ OAuth クライアント ID |
 | `--oauth-client-secret` | `IAP_AUTHER_OAUTH_CLIENT_SECRET` / `IAP_MCP_OAUTH_CLIENT_SECRET` | — | デスクトップ OAuth クライアントシークレット |
-| `--token-store` | `IAP_AUTHER_TOKEN_STORE` / `IAP_MCP_TOKEN_STORE` | `auto` | OAuth リフレッシュトークンの保存先 (`auto` / `os` / `file`)。`auto` は OS ストア優先（既存のファイル保存分を自動移行し旧ファイルを削除、OS ストア利用不可時はファイル保存へフォールバック）、`os` は OS ストア必須、`file` は従来ファイル (DPAPI / `0600`) |
+| `--token-store` | `IAP_AUTHER_TOKEN_STORE` / `IAP_MCP_TOKEN_STORE` | `auto` | OAuth リフレッシュトークンの保存先・クリア対象 (`auto` / `os` / `file`)。`auto` は OS ストア優先（既存のファイル保存分を自動移行し旧ファイルを削除、OS ストア利用不可時はファイル保存へフォールバック）、`os` は OS ストア必須、`file` は従来ファイル (DPAPI / `0600`) |
+| `--all` *(logout)* | — | `false` | `iap-auther` が保存したすべての OAuth リフレッシュトークンを一括削除 (`--oauth-client-id` と併用不可) |
 | `--no-browser` | — | `false` | ブラウザを自動起動せず認証 URL をログ出力先 (デフォルト `stderr`) に表示 |
 | `-l, --log-level` | `IAP_AUTHER_LOG` / `IAP_MCP_LOG` | `warn` | `debug` / `info` / `warn` / `error` |
 | `--log-output` | `IAP_AUTHER_LOG_OUTPUT` / `IAP_MCP_LOG_OUTPUT` | `stderr` | ログ・エラー・認証案内の出力先 (`stderr` / `stdout` / `both`)。`stdout` / `both` はデバッグ用途向け (`token` / `headers` / `mcp-proxy` の機械処理用 `stdout` に混ざるため通常利用時は非推奨) |
-| `-f, --format` *(token)* | — | `raw` | 出力形式 (`raw` / `header` / `json`) |
+| `-f, --format` *(token / logout)* | — | `raw` (`token`) / `text` (`logout`) | 出力形式 (`token`: `raw` / `header` / `json`、`logout`: `text` / `json`) |
 | `-H, --header` *(headers)* | — | — | 追加 HTTP ヘッダ (`Name: Value` 形式、複数指定可、`env:VAR_NAME` 参照対応) |
 | `--downstream-auth` *(mcp-proxy)* | `IAP_AUTHER_DOWNSTREAM_AUTH` / `IAP_MCP_DOWNSTREAM_AUTH` | — | 上流 `Authorization` ヘッダーに転送する値 (`env:VAR_NAME` 参照対応) |
 | `--refresh-margin` *(mcp-proxy)* | `IAP_AUTHER_REFRESH_MARGIN` / `IAP_MCP_REFRESH_MARGIN` | `5m` | 有効期限の指定時間前にトークンを更新 |
